@@ -75,6 +75,16 @@ typedef struct {
         float p_mvsq;    /* mean( (v-mean_v)*(i-mean_i) ) [mV²] */
 } batch_metrics_t;
 
+typedef struct {
+        float    prev_rv;        /* last AC voltage residual of previous batch */
+        float    dc_ema;         /* EMA of raw mV — tracks mid-rail DC offset */
+        uint32_t total_samples;  /* cumulative samples processed in window */
+        uint32_t cross_count;    /* rising zero-crossings detected */
+        float    first_cross;    /* fractional sample index of first crossing */
+        float    last_cross;     /* fractional sample index of last crossing */
+        bool     armed;          /* signal confirmed below -ZCD_HYST_MV */
+} zcd_state_t;
+
 /*
  * Two-pass batch computation of AC RMS and mean instantaneous power.
  *
@@ -119,6 +129,45 @@ static batch_metrics_t compute_batch_metrics(
         return res;
 }
 
+/* ── ZCD tuning ──────────────────────────────────────────────────────────── */
+#define ZCD_HYST_MV   50.0f   /* hysteresis: signal must dip below -50 mV before arming */
+#define ZCD_DC_ALPHA   0.01f  /* EMA coefficient for DC tracking (~100-sample time constant) */
+
+/*
+ * Single-pass ZCD update: EMA tracks the mid-rail DC offset per sample,
+ * eliminating the per-batch mean drift that caused reading jitter.
+ * Crossing indices are fractional sample positions (absolute within window).
+ */
+static void batch_zcd_update(zcd_state_t *z,
+        const uint16_t *raw_v, int n,
+        const ad_gpadc_driver_conf_t *drv_v)
+{
+        float rv_prev = z->prev_rv;
+        for (int k = 0; k < n; k++) {
+                const float mv      = (float)ad_gpadc_conv_to_mvolt(drv_v, raw_v[k]);
+                z->dc_ema          += ZCD_DC_ALPHA * (mv - z->dc_ema);
+                const float rv_curr = mv - z->dc_ema;
+
+                if (rv_curr < -ZCD_HYST_MV)
+                        z->armed = true;
+
+                if (z->armed && rv_prev < 0.0f && rv_curr >= 0.0f) {
+                        /* Interpolate zero-crossing between samples k-1 and k */
+                        const float alpha   = (-rv_prev) / (rv_curr - rv_prev);
+                        const float t_cross = (float)z->total_samples
+                                            + (float)(k - 1) + alpha;
+                        if (z->cross_count == 0)
+                                z->first_cross = t_cross;
+                        z->last_cross = t_cross;
+                        z->cross_count++;
+                        z->armed = false;
+                }
+                rv_prev = rv_curr;
+        }
+        z->prev_rv        = rv_prev;
+        z->total_samples += (uint32_t)n;
+}
+
 /* ─────────────────────────────────────────────────────────────────────────── */
 
 void gpadc_app_task(void *pvParameters)
@@ -131,6 +180,7 @@ void gpadc_app_task(void *pvParameters)
         static float      rms2_accum_ch0    = 0.0f;
         static float      rms2_accum_ch1    = 0.0f;
         static float      p_accum           = 0.0f;
+        static zcd_state_t zcd_state        = {0};
 
         /* Enable DWT cycle counter */
         CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
@@ -202,6 +252,9 @@ void gpadc_app_task(void *pvParameters)
                         p_accum        += m.p_mvsq;
                 }
 
+                /* ── 2b. ZCD update for frequency estimation ─────────────── */
+                batch_zcd_update(&zcd_state, raw1, BATCH_SIZE, CHAN1_DEVICE->drv);
+
                 /* ── 3. Per-sample CSV print (disabled; enable for plotter) ─ */
 #if 0
                 for (int i = 0; i < BATCH_SIZE; i++) {
@@ -224,6 +277,22 @@ void gpadc_app_task(void *pvParameters)
                                         / (total_pairs * (CPU_CLOCK_HZ / 1000000UL));
                                 printf("*fs_acq=%u  *us_pair=%u\n",
                                        (unsigned)fs_acq, (unsigned)us_pair);
+
+                                float freq_hz = 0.0f;
+                                if (zcd_state.cross_count >= 2) {
+                                        /* total_samples is the exact count of voltage-channel
+                                         * samples taken in this ~1 s window, giving the true
+                                         * per-channel rate without fs_acq's acquisition-only bias. */
+                                        float periods_s =
+                                                (zcd_state.last_cross - zcd_state.first_cross)
+                                                / (float)zcd_state.total_samples;
+                                        freq_hz = (float)(zcd_state.cross_count - 1u)
+                                                / periods_s;
+                                }
+                                int32_t freq_cHz = (int32_t)(freq_hz * 100.0f + 0.5f);
+                                printf("*freq=%"PRId32".%02"PRId32" Hz  xings=%"PRIu32"\n",
+                                       freq_cHz / 100, freq_cHz % 100,
+                                       zcd_state.cross_count);
 
                                 float rms_mv0_w = sqrtf(rms2_accum_ch0 / (float)batches_in_window);
                                 float rms_mv1_w = sqrtf(rms2_accum_ch1 / (float)batches_in_window);
@@ -270,7 +339,7 @@ void gpadc_app_task(void *pvParameters)
                                         .v_rms       = (int16_t)v_rms_cV,
                                         .i_rms       = (int16_t)i_rms_mA,
                                         .p_w         = p_cW,
-                                        .freq        = 5000,
+                                        .freq        = (int16_t)freq_cHz,
                                         .temp        = (int16_t)t_x100,
                                         .humid       = (uint16_t)((uint32_t)hum * 100u),
                                         .relay_state = 0,
@@ -286,6 +355,16 @@ void gpadc_app_task(void *pvParameters)
                         rms2_accum_ch1    = 0.0f;
                         p_accum           = 0.0f;
                         t_last            = now;
+                        {
+                                /* Preserve continuity state across the window boundary */
+                                float saved_prev  = zcd_state.prev_rv;
+                                float saved_dc    = zcd_state.dc_ema;
+                                bool  saved_armed = zcd_state.armed;
+                                zcd_state         = (zcd_state_t){0};
+                                zcd_state.prev_rv = saved_prev;
+                                zcd_state.dc_ema  = saved_dc;
+                                zcd_state.armed   = saved_armed;
+                        }
 
                         /* Each ADC conversion (~478 �s) completes faster than one
                          * FreeRTOS tick (1 ms), so the idle task is never scheduled
