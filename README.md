@@ -1,40 +1,22 @@
-# Bluetooth SensorNode — Wireless AC Energy Monitor
+# DA14706 BLE Energy Monitor — Sensor Node
 
-BLE peripheral firmware for the **Renesas DA14706** (DA1470x family). Measures AC mains voltage, current, and power via a 2-channel GPADC front-end, reads ambient temperature/humidity from an AHT20 sensor over I2C, and exposes both sensor data and relay control over a custom BLE GATT service.
-
-Merged from two working projects:
-- **BLE-Relay_control** — BLE peripheral with relay control characteristic
-- **i2c_and_2ch_gpadc** — GPADC 2-channel interleaved AC measurement + AHT20 I2C
+BLE peripheral firmware for the **Renesas DA14706** (Cortex-M33, DA1470x family). Measures AC mains voltage, current, active power, and line frequency from a home appliance, reads ambient temperature and humidity from an AHT20 over I2C, and streams all measurements to a BLE central every second. A relay output allows remote load switching.
 
 ---
 
 ## Hardware
 
-### Components
+| Component | Part | Interface | Pin(s) |
+|---|---|---|---|
+| MCU | Renesas DA14706 (Cortex-M33, 32 MHz) | — | — |
+| Voltage sensor | BEL DPC12 step-down transformer | GPADC CH1 | P0_6 |
+| Current sensor | LEM HLSR 10P Hall sensor (80 mV/A) | GPADC CH0 | P0_5 |
+| Temp / Humidity | AHT20 | I2C — MikroBUS 1 | SDA = P1_11, SCL = P1_12 |
+| Relay | 1-channel relay board (250 V AC / 10 A) | GPIO — MikroBUS 2 | P1_00 (active-high) |
 
-| Component | Description |
-|---|---|
-| Renesas DA14706 | DA1470x Pro Development Kit (Cortex-M33) |
-| Voltage sensing | Step-down transformer + resistive divider → P0.6 (ADC CH1) |
-| Current sensing | Hall-effect sensor (80 mV/A sensitivity) → P0.5 (ADC CH0) |
-| AHT20 | I2C temperature/humidity sensor |
-| Soldered 333024 | 1-channel relay board (250 V AC / 10 A) |
-| LM7805 | 5V regulator for relay VCC in production setup |
+Both analog sensors feed signal-conditioning circuits that scale and level-shift the mains signals into the GPADC input range. One conditioning stage inverts the channel polarity, compensated by `P_SIGN = -1` in software.
 
-### GPIO Assignment
-
-| Signal | Port/Pin | Notes |
-|---|---|---|
-| ADC CH0 (current) | P0.5 | Hall sensor input, `HW_GPIO_FUNC_ADC` |
-| ADC CH1 (voltage) | P0.6 | Transformer/divider input, `HW_GPIO_FUNC_ADC` |
-| I2C SDA (AHT20) | Configured in `platform_devices.c` | |
-| I2C SCL (AHT20) | Configured in `platform_devices.c` | |
-| Relay IN | P1.0 (MikroBUS 1 PWM) | `HW_GPIO_POWER_V33`, active-high |
-
-### Relay Power Supply Notes
-
-- **Development**: power relay VCC from a bench DC supply (5V, ≥500 mA). The devkit's MikroBUS 3.3V/5V rails cannot source the ~70–100 mA relay coil draw.
-- **Production**: use an LM7805 (5V output) to power relay VCC.
+> **Relay power supply**: the relay coil draws ~70–100 mA. During development power its VCC from a bench supply. For a standalone deployment use an LM7805 (5 V, ≥200 mA) fed from the mains supply.
 
 ---
 
@@ -42,7 +24,7 @@ Merged from two working projects:
 
 | Tool | Version |
 |---|---|
-| SmartSnippets Studio | 2.0.18 or higher |
+| SmartSnippets Studio | 2.0.18+ |
 | DA1470x SDK | 10.2.6.49 |
 | SEGGER J-Link | Latest |
 
@@ -51,231 +33,210 @@ Merged from two working projects:
 ## Project Structure
 
 ```
-Bluetooth_SensorNode/
+DA14706_ble_sensor_node/
 ├── config/
-│   ├── ble_peripheral_config.h   # Feature flags (CFG_MY_CUSTOM_SERVICE = 1)
-│   ├── custom_config_ram.h       # Build config for RAM execution (debug)
-│   ├── custom_config_oqspi.h     # Build config for OQSPI flash (production)
-│   ├── peripheral_setup.h        # Pin assignments
-│   └── platform_devices.c/.h    # GPADC, I2C, relay adapter descriptors
+│   ├── ble_peripheral_config.h      # Feature flags (CFG_MY_CUSTOM_SERVICE = 1)
+│   ├── custom_config_ram.h          # Build config — RAM execution (debug)
+│   ├── custom_config_oqspi.h        # Build config — OQSPI flash (production)
+│   ├── peripheral_setup.h           # I2C pin assignments
+│   └── platform_devices.c/.h        # GPADC, I2C, relay adapter descriptors
 ├── drivers/aht20/
-│   ├── driver_aht20.c/.h         # AHT20 sensor driver
+│   ├── driver_aht20.c/.h            # AHT20 libdriver
 │   └── driver_aht20_interface.c/.h  # DA14706 I2C adapter glue
 ├── include/
-│   ├── gpadc_app.h               # gpadc_app_task() declaration
-│   └── aht20_task.h              # aht20_task_start() declaration
-├── main.c                        # System init, task creation, queue creation
-├── meas_packet.h                 # meas_packet_t struct + shared queue/task handle
-├── gpadc_app.c                   # GPADC acquisition task (AC RMS, power)
-├── aht20_task.c                  # AHT20 I2C polling task
-├── ble_peripheral_task.c         # BLE GATT server, event loop, relay + notify logic
-└── my_custom_service.c/.h        # Custom GATT service implementation
+│   ├── gpadc_app.h                  # gpadc_app_task() declaration
+│   └── aht20_task.h                 # aht20_task_start() declaration
+├── main.c                           # System init, task creation, queue creation
+├── meas_packet.h                    # Shared 15-byte measurement packet definition
+├── gpadc_app.c                      # AC measurement task (RMS, power, frequency)
+├── aht20_task.c                     # AHT20 I2C polling task
+├── ble_peripheral_task.c            # BLE GATT server, relay control, notifications
+└── my_custom_service.c/.h           # Custom GATT service implementation
 ```
 
 ---
 
 ## Firmware Architecture
 
-Three FreeRTOS tasks run concurrently at `OS_TASK_PRIORITY_NORMAL`:
+Three FreeRTOS tasks run concurrently under `pm_mode_idle`:
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  gpadc_app_task                                              │
-│  • Interleaved CH0/CH1 acquisition — BATCH_SIZE=64 samples  │
-│  • 1-second RMS/power window, prints diagnostics to UART    │
-│  • Writes meas_packet_t to g_meas_queue (xQueueOverwrite)   │
-│  • Sends MEAS_DATA_NOTIF to ble_peripheral_task handle      │
-└───────────────────────────┬──────────────────────────────────┘
-                            │ OS_TASK_NOTIFY (MEAS_DATA_NOTIF)
+┌─────────────────────────────────────────────────────────────────┐
+│  gpadc_app_task                                                 │
+│  • Interleaved 2-channel ADC acquisition (BATCH_SIZE = 64)      │
+│  • Per-batch: AC RMS, active power P, ZCD frequency update      │
+│  • Every 1 s: scales to physical units, writes meas_packet_t    │
+│    to g_meas_queue, notifies ble_peripheral_task                │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │ MEAS_DATA_NOTIF (OS task notify)
                             ▼
-┌──────────────────────────────────────────────────────────────┐
-│  ble_peripheral_task                                         │
-│  • BLE GATT server (advertising, connection management)      │
-│  • Handles relay write commands on characteristic 1          │
-│  • On MEAS_DATA_NOTIF: dequeues packet, injects relay_state  │
-│    → mcs_notify_meas_all() → GATT notification to clients    │
-└──────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  ble_peripheral_task                                            │
+│  • BLE GATT server — advertising, connection, pairing           │
+│  • Relay characteristic: write 0x01/0x00/0xFF → ON/OFF/TOGGLE  │
+│  • On MEAS_DATA_NOTIF: dequeues packet, injects relay state,    │
+│    sends GATT notification to all subscribed centrals           │
+└─────────────────────────────────────────────────────────────────┘
 
-┌──────────────────────────────────────────────────────────────┐
-│  aht20_task                                                  │
-│  • Polls AHT20 over I2C every ~2 s                           │
-│  • Updates g_last_temp_c, g_last_hum_percent (volatile)      │
-│  • gpadc_app_task snapshots these at each 1-second window    │
-└──────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  aht20_task                                                     │
+│  • Reads AHT20 via I2C every 2 s                                │
+│  • Writes g_last_temp_c, g_last_hum_percent (volatile globals)  │
+│  • gpadc_app_task snapshots these at each 1-second window       │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### Sleep Mode
+`pm_mode_idle` is required because `gpadc_app_task` runs a continuous ADC loop — deep sleep would interrupt acquisition. The BLE stack operates normally in idle mode.
 
-`pm_mode_idle` is required because `gpadc_app_task` runs a continuous ADC sampling loop. Deep sleep would interrupt the acquisition. The BLE stack operates normally in idle mode.
+---
 
-### Hardware Watchdog
+## Signal Processing (gpadc_app.c)
 
-The ADC conversion loop (~478 µs per CH0+CH1 pair) completes faster than one FreeRTOS tick (1 ms), which permanently starves the idle task and causes a hardware watchdog timeout after ~10 s. A `vTaskDelay(pdMS_TO_TICKS(1))` at the end of each 1-second measurement window forces a scheduler yield so the idle task can run and feed the watchdog.
+### Acquisition
+
+Each loop iteration opens CH0 (current) then CH1 (voltage) alternately for `BATCH_SIZE = 64` sample pairs. A DWT cycle-counter timestamps the batch for throughput measurement. At ~478 µs per conversion the per-channel sample rate is approximately **1046 Sa/s** (~40 samples per 50 Hz cycle).
+
+### Per-batch: AC RMS and Active Power (`compute_batch_metrics`)
+
+Two-pass computation:
+- **Pass 1** — convert raw counts to mV, compute per-channel DC offsets (`mean_v`, `mean_i`).
+- **Pass 2** — accumulate squared residuals (`rv²`, `ri²`) for RMS, and the cross-product (`rv × ri`) for active power. Mean subtraction removes the DC×DC bias term from P.
+
+RMS² and cross-product accumulators are summed across all batches in the 1-second window, then square-rooted and scaled to physical units.
+
+### Per-batch: Frequency via Interpolated ZCD (`batch_zcd_update`)
+
+Single-pass zero-crossing detector with sub-sample interpolation:
+
+1. **EMA DC tracking** (`ZCD_DC_ALPHA = 0.01`, ~100-sample time constant) — updates every sample, tracking the mid-rail DC offset without batch-boundary drift.
+2. **Hysteresis arming** (`ZCD_HYST_MV = 50 mV`) — the detector arms only after the AC residual dips below −50 mV, preventing false triggers from noise near zero.
+3. **Interpolated crossing** — when the armed detector sees a residual sign change (negative → positive), the exact zero-crossing is placed at a fractional sample index using linear interpolation between the two bracketing samples:
+
+```
+alpha   = |rv[k-1]| / (rv[k] - rv[k-1])
+t_cross = total_samples + (k - 1) + alpha
+```
+
+### Every Second: Frequency Derivation
+
+```
+freq = (N_crossings - 1) / ((t_last_cross - t_first_cross) / total_samples)
+```
+
+`total_samples` (the actual count of voltage-channel samples taken in the window) is used as the per-channel rate. This avoids the ×2 bias in the dual-channel `fs_acq` figure and the acquisition-only bias that excludes inter-batch processing time.
 
 ---
 
 ## BLE GATT Service
 
-**Service UUID**: `00000000-1111-2222-2222-333333333333`  
-**Device advertisement name**: `BLE_RELAY_CTRL`
+**Advertising name**: `BLE_Relay_Ctrl`
 
-### Characteristic 1 — Relay Control
-
-| Attribute | Value |
-|---|---|
-| UUID | `11111111-0000-0000-0000-111111111111` |
-| Properties | Read / Write / Notify |
-| Length | 1 byte |
-| User Description | `Relay: 0x01=ON 0x00=OFF 0xFF=TOGGLE` |
+### Relay Characteristic (read / write / notify)
 
 | Write value | Action |
 |---|---|
-| `0x01` | Relay ON (coil energized, COM → NO) |
-| `0x00` | Relay OFF (coil de-energized, COM → NC) |
+| `0x01` | Relay ON |
+| `0x00` | Relay OFF |
 | `0xFF` | Toggle current state |
 
-Any other value returns `ATT_ERROR_APPLICATION_ERROR`. A GATT notification is sent to all subscribed clients whenever the relay state changes.
+Any other value returns `ATT_ERROR_APPLICATION_ERROR`. All subscribed clients receive a notification whenever the relay state changes.
 
-### Characteristic 2 — Measurements
+### Measurement Characteristic (notify — 1 Hz)
 
-| Attribute | Value |
-|---|---|
-| UUID | `22222222-0000-0000-0000-222222222222` |
-| Properties | Notify only |
-| Length | 15 bytes |
-| Rate | 1 notification per second |
-
-Write `0x0001` to the CCC descriptor (UUID `0x2902`) to enable notifications. The measurement packet is only sent to clients that have subscribed.
+Subscribe by writing `0x0001` to the CCC descriptor (UUID `0x2902`). Packets arrive once per second.
 
 ---
 
 ## Measurement Packet Format
 
-15-byte packed struct, little-endian (Cortex-M33 native):
+`meas_packet_t` — **15 bytes**, packed, little-endian:
 
-```
-Offset  Size  Type     Field         Unit         Example
-──────  ────  ───────  ────────────  ───────────  ────────────────
-  0     2     int16    v_rms         centivolts   23045 = 230.45 V
-  2     2     int16    i_rms         milliamps     1500 =   1.500 A
-  4     4     int32    p_w           centiwatts  104230 = 1042.30 W
-  8     2     int16    freq          centi-Hz      5000 =  50.00 Hz (placeholder)
- 10     2     int16    temp          centi-°C      2584 =  25.84 °C
- 12     2     uint16   humid         centi-%RH     3800 =  38.00 %RH
- 14     1     uint8    relay_state   0/1          0 = OFF, 1 = ON
-```
+| Offset | Size | Type | Field | Unit | Example raw | Decoded |
+|---|---|---|---|---|---|---|
+| 0 | 2 | int16 | `v_rms` | centi-V | 23041 | 230.41 V |
+| 2 | 2 | int16 | `i_rms` | milli-A | 1500 | 1.500 A |
+| 4 | 4 | int32 | `p_w` | centi-W | 34567 | 345.67 W |
+| 8 | 2 | int16 | `freq` | centi-Hz | 5002 | 50.02 Hz |
+| 10 | 2 | int16 | `temp` | centi-°C | 2584 | 25.84 °C |
+| 12 | 2 | uint16 | `humid` | centi-%RH | 4000 | 40.00 % |
+| 14 | 1 | uint8 | `relay_state` | 0 / 1 | 1 | ON |
+
+`freq = 0` means no voltage signal was detected (appliance under measurement is off or disconnected).
 
 S (apparent power), Q (reactive power), and PF (power factor) are not transmitted — the central node derives them from `v_rms`, `i_rms`, and `p_w`.
-
-`freq` is a placeholder (`5000` = 50.00 Hz). Zero-crossing detection is not yet implemented.
 
 Python struct format string: `"<hhihhHB"` (15 bytes).
 
 ---
 
-## Calibration (`gpadc_app.c`)
+## Calibration
 
-| Constant | Default | Description |
-|---|---|---|
-| `K_V` | `283.620f` | Mains V per ADC mV — transformer ratio × attenuator (calibrated 10/06) |
-| `K_I` | `1.297f` | Signal conditioning gain on current channel (calibrated 10/06) |
-| `HALL_SENSITIVITY_MV_PER_A` | `80.0f` | Hall sensor sensitivity [mV/A] |
-| `P_SIGN` | `-1.0f` | Set to -1 when signal conditioning inverts one channel |
-| `OFFSET_MV_CH0/1` | `0.0f` | Per-channel ADC DC offset correction [mV] |
-| `GAIN_CH0/1` | `1.0f` | Per-channel ADC gain correction |
+Constants at the top of [gpadc_app.c](gpadc_app.c):
 
-**Voltage calibration**: measure the true mains voltage with a reference instrument and adjust `K_V` proportionally:
-
+```c
+#define K_V                       (283.620f)   // mains V per ADC mV  — calibrated 10/06
+#define K_I                       (1.297f)     // conditioning gain on current channel — calibrated 10/06
+#define HALL_SENSITIVITY_MV_PER_A (80.0f)      // LEM HLSR 10P: 80 mV/A
+#define P_SIGN                    (-1.0f)       // -1 when conditioning inverts one channel
 ```
-K_V_new = K_V_current × (V_true / V_displayed)
+
+**To recalibrate `K_V`**: apply known mains voltage, read `*Vrms` from the serial terminal, then:
 ```
+K_V_new = K_V_current × (V_reference / V_displayed)
+```
+
+**To recalibrate `K_I`**: apply a known AC current (or use a clamp meter reference) and adjust `K_I` by the same ratio.
 
 ---
 
-## Build Configurations
+## ZCD Tuning
 
-| Configuration | Config header | Use case |
-|---|---|---|
-| `DA14706-00-Debug_RAM` | `custom_config_ram.h` | Development — executes from RAM, exits when GDB session closes |
-| `DA14706-00-Release_OQSPI` | `custom_config_oqspi.h` | Production — flashed to OQSPI, persists across resets |
+```c
+#define ZCD_HYST_MV   50.0f   // hysteresis: arm below -50 mV ADC, fire at zero
+#define ZCD_DC_ALPHA   0.01f  // EMA coefficient (~100-sample / ~95 ms time constant)
+```
 
-**For persistent standalone operation, always flash the OQSPI configuration.**
-
-### Build Steps
-
-1. **File → Import → Existing Projects into Workspace** → select `Bluetooth_SensorNode`
-2. Select the desired build configuration from the dropdown toolbar
-3. **Project → Build Project** (`Ctrl+B`)
-4. Flash via the **Run → Debug** launcher (RAM) or the `program_oqspi_jtag` launcher (OQSPI)
-
-### Eclipse CDT Indexer Notes
-
-Red underlines on `g_meas_queue`, `MEAS_DATA_NOTIF`, or `meas_packet_t` are **indexer errors only** — the build succeeds. To clear them: **Project → Index → Rebuild**.
+- Increase `ZCD_HYST_MV` if you see spurious extra crossings on a noisy or distorted waveform.
+- The EMA settles in ~100 ms after boot. The first 1-second frequency report may be slightly off; from the second window onward accuracy is typically **±0.1 Hz**.
 
 ---
 
 ## Serial Diagnostic Output
 
-`CONFIG_RETARGET` is defined in both config headers. Connect a serial terminal at **115200 8N1**.
-
-Expected output at each 1-second window:
+Connect a serial terminal at **115200 8N1** (`CONFIG_RETARGET` is enabled in both build configs).
 
 ```
-*skew=15312 cycles (~478 us)        ← inter-channel ADC delay (printed once at startup)
-*fs_acq=2096  *us_pair=478          ← acquisition throughput
-*Temp=25.84 C  *Hum=38%
+*skew=15312 cycles (~478 us)       ← CH0→CH1 inter-sample delay, printed once at startup
+*fs_acq=2092  *us_pair=956         ← ADC throughput: dual-channel Sa/s, µs per CH0+CH1 pair
+*freq=50.02 Hz  xings=50           ← mains frequency and crossing count this window
+*Temp=25.84 C  *Hum=40%            ← AHT20 snapshot
 ```
 
-> Vrms, Irms, P, S, Q, and PF serial prints are disabled in this version. All power metrics are computed on the Central Node from the BLE measurement packet.
+Vrms, Irms, P, S, Q, and PF serial prints are disabled — all power metrics are forwarded via the BLE packet and decoded on the central node.
 
 ---
 
-## Testing with nRF Connect (Mobile)
+## Build Configurations
 
-1. Open **nRF Connect** → Scan → connect to **`BLE_RELAY_CTRL`**
-2. Navigate to service `00000000-1111-2222-2222-333333333333`
-3. **Relay control** (char `11111111-...`):
-   - Tap the subscribe button to receive relay state notifications
-   - Tap the write button → send `01` (ON), `00` (OFF), or `FF` (TOGGLE)
-4. **Measurements** (char `22222222-...`):
-   - Tap the subscribe button on the characteristic row to enable notifications
-   - Measurement packets appear as hex value updates once per second
+| Configuration | Config header | Use |
+|---|---|---|
+| `DA14706-00-Debug_RAM` | `custom_config_ram.h` | Development — runs from RAM, exits when GDB closes |
+| `DA14706-00-Release_OQSPI` | `custom_config_oqspi.h` | Production — flashed to OQSPI, persists across resets |
 
----
+### Build Steps
 
-## Testing with the Python Central Node
+1. **File → Import → Existing Projects into Workspace** → select this folder.
+2. Select build configuration from the toolbar dropdown.
+3. **Project → Build Project** (`Ctrl+B`).
+4. Flash via the **Run → Debug** launcher (RAM) or the `program_oqspi_jtag` launcher (OQSPI).
 
-A Python 3 BLE central script is at `../Bluetooth_CentralNode/central_node.py`.
-
-```bash
-pip install bleak
-python ../Bluetooth_CentralNode/central_node.py
-```
-
-Expected output:
-
-```
-Connected: True
-Discovering services...
-Subscribed. MEAS packet is 15 bytes. Listening... Ctrl+C to stop.
-Vrms=230.45 V  Irms=4.412 A  P=1042.30 W  f=50.00 Hz  T=25.84 °C  H=38.00%  Relay=OFF
-```
-
-Update `ADDRESS` in `central_node.py` if the device MAC address differs from `48:23:35:F4:00:07`.
+> Red underlines on `g_meas_queue`, `MEAS_DATA_NOTIF`, or `meas_packet_t` are CDT indexer artefacts — the build succeeds. Clear them with **Project → Index → Rebuild**.
 
 ---
 
-## Known Limitations
+## Known Limitations / Planned Improvements
 
-- **Frequency measurement**: `freq` is a fixed placeholder (50.00 Hz). Zero-crossing detection is not yet implemented.
-- **Relay state persistence**: relay defaults to OFF on each power cycle.
-- **Single relay**: only one relay output is supported.
-- **Floating ADC inputs**: when no AC signal is connected, the ADC channels pick up noise and report non-zero (but meaningless) RMS values.
-
----
-
-## License
-
-Copyright (C) 2015–2022 Dialog Semiconductor. All Rights Reserved.
-
-Based on the `ble_custom_service` and `i2c_and_2ch_gpadc` samples from the DA1470x SDK 10.2.6.49.
+- **Q, S, PF not transmitted.** The commented-out code in `gpadc_app_task` computes them correctly for a balanced sinusoidal load but does not correct for the ~478 µs sequential-sampling skew between CH0 and CH1. At 50 Hz this introduces ~8–9° of phase error, causing a systematic PF underestimate on resistive loads. Planned fix: interpolate the voltage sample back to the instant the current sample was taken using the measured startup skew.
+- **Per-batch DC mean for power.** `compute_batch_metrics` subtracts a per-batch mean from V and I before computing P. If a batch does not span an integer number of mains cycles the mean is slightly biased. A global mean across the full 1-second window would be more accurate.
+- **Calibration constants are hardcoded.** No runtime calibration procedure or NVM storage is implemented yet.
+- **Relay state is not persistent.** The relay always starts OFF after a power cycle.
