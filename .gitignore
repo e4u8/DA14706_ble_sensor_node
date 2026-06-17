@@ -1,4 +1,3 @@
- 
 Debug/
 Release/
 *.o
@@ -13,4 +12,4 @@ Release/
 *.launch
 out/
 Thumbs.db
-desktop.ini
+desktop.ini 
