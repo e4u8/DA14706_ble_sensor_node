@@ -16,7 +16,7 @@ BLE peripheral firmware for the **Renesas DA14706** (Cortex-M33, DA1470x family)
 
 Both analog sensors feed signal-conditioning circuits that scale and level-shift the mains signals into the GPADC input range. One conditioning stage inverts the channel polarity, compensated by `P_SIGN = -1` in software.
 
-> **Relay power supply**: the relay coil draws ~70–100 mA. During development power its VCC from a bench supply. For a standalone deployment use an LM7805 (5 V, ≥200 mA) fed from the mains supply.
+> **Relay power supply**: the relay coil draws ~70–100 mA. During development power its VCC from a bench supply. For a standalone deployment use an LM7805 (5 V, ≥200 mA) fed from a 12V DC power supply.
 
 ---
 
@@ -177,7 +177,7 @@ Constants at the top of [gpadc_app.c](gpadc_app.c):
 #define K_V                       (283.620f)   // mains V per ADC mV  — calibrated 10/06
 #define K_I                       (1.297f)     // conditioning gain on current channel — calibrated 10/06
 #define HALL_SENSITIVITY_MV_PER_A (80.0f)      // LEM HLSR 10P: 80 mV/A
-#define P_SIGN                    (-1.0f)       // -1 when conditioning inverts one channel
+#define P_SIGN                    (-1.0f)      // -1 when conditioning inverts one channel
 ```
 
 **To recalibrate `K_V`**: apply known mains voltage, read `*Vrms` from the serial terminal, then:
