@@ -297,15 +297,21 @@ void gpadc_app_task(void *pvParameters)
                                 float rms_mv0_w = sqrtf(rms2_accum_ch0 / (float)batches_in_window);
                                 float rms_mv1_w = sqrtf(rms2_accum_ch1 / (float)batches_in_window);
 
+                                int32_t ch0_uV = (int32_t)(rms_mv0_w * 1000.0f);
+                                int32_t ch1_uV = (int32_t)(rms_mv1_w * 1000.0f);
+                                printf("*CH0_rms=%"PRId32".%03"PRId32" mV  *CH1_rms=%"PRId32".%03"PRId32" mV\n",
+                                       ch0_uV / 1000, (int32_t)abs(ch0_uV) % 1000,
+                                       ch1_uV / 1000, (int32_t)abs(ch1_uV) % 1000);
+
                                 float v_rms = K_V * rms_mv1_w / 1000.0f;
                                 float i_rms = (K_I * rms_mv0_w) / HALL_SENSITIVITY_MV_PER_A;
 
                                 int32_t v_rms_cV = (int32_t)(v_rms * V_RMS_SCALE);
                                 int32_t i_rms_mA = (int32_t)(i_rms * I_RMS_SCALE);
 
-                                //printf("*Vrms=%"PRId32".%02"PRId32" V  *Irms=%"PRId32".%03"PRId32" A\n",
-                                //       v_rms_cV / 100,  v_rms_cV % 100,
-                                //       i_rms_mA / 1000, i_rms_mA % 1000);
+                                printf("*Vrms=%"PRId32".%02"PRId32" V  *Irms=%"PRId32".%03"PRId32" A\n",
+                                       v_rms_cV / 100,  (int32_t)abs(v_rms_cV) % 100,
+                                       i_rms_mA / 1000, (int32_t)abs(i_rms_mA) % 1000);
 
                                 float p_w   = P_SIGN * P_SCALE * (p_accum / (float)batches_in_window);
                                 //float s_va  = v_rms * i_rms;
