@@ -46,7 +46,7 @@ extern volatile uint8_t g_last_hum_percent;
  * K_I  : Hall sensor mV per ADC millivolt [mV/mV] — signal conditioning.    *
  * HALL_SENSITIVITY_MV_PER_A : Hall sensor output sensitivity [mV/A].        *
  * ─────────────────────────────────────────────────────────────────────────  */
-#define K_V                       (280.9585f)   // calibration 22/06
+#define K_V                       (284.9455f)   // calibration 23/06 | calibration 22/06 (280.9585f) 
 #define K_I                       (1.297f)      // calibration 10/06 
 #define HALL_SENSITIVITY_MV_PER_A (80.0f)
 #define P_SIGN                    (-1.0f)   /* -1: signal conditioning inverts one channel */
